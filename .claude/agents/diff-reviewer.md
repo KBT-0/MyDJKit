@@ -6,6 +6,7 @@ description: >
   review-tooling or tool-settings diff takes one `scripts/review.sh` round instead
   (`docs/REVIEW_GATE.md`, "Invariant"). Spawn FRESH: the implementer session must never review its own patch.
 model: inherit
+effort: high
 omitClaudeMd: true
 tools: Read, Grep, Glob, Bash
 ---

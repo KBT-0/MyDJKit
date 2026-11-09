@@ -102,4 +102,4 @@ STATE_MAX_LINES=300
 # CODEX_MODEL from these lines, so keep each on a line of its own in this form.
 DEFAULT_REVIEWER="claude"
 CODEX_MODEL=""
-CLAUDE_MODEL=""
+CLAUDE_MODEL="claude-opus-5-5"
