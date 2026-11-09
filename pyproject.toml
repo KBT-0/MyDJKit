@@ -1,0 +1,21 @@
+[project]
+name = "mydjkit"
+version = "0.1.0"
+description = "BPM- and key-compatible DJ set builder for Rekordbox 7"
+requires-python = ">=3.11"
+dependencies = ["pyrekordbox==0.4.4", "sqlcipher3-wheels==0.5.5"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+# kit-owned code is linted in the kit, not here
+extend-exclude = ["scripts", ".claude", "setup"]
+line-length = 140
+
+[tool.ruff.lint]
+# the code is deliberately compact (one-line ifs, lambdas); lint catches real bugs, not layout
+select = ["E9", "F"]

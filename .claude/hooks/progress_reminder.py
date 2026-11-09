@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""PostToolUse: after ten tool calls with no visible line, remind the agent to say what it does.
+
+`docs/COMMUNICATION.md` ("Progress"): one sentence at a finding, a turn or a block, never a
+long silence. Anthropic measured that a reminder after about five silent steps halved the
+share of tasks with long silences; this kit uses ten and one reminder (owner 2026-10-26: the
+replies were too long to read; labricore's lead saw four reminders in twenty read-only calls).
+While the owner is away (autopilot) nobody reads the chat, so no reminder is given.
+
+The hook counts the tool calls in the transcript since the agent's last non-empty text block
+(or the last compaction) and adds one line of context each time that count passes a multiple
+of STEP. Claude Code writes one record per content block, a parallel batch runs this hook once
+per call, and a sub-agent's calls may see the lead's frozen transcript; so the count at the
+last nudge is kept beside the transcript (`<session>.progress-step`, with the id of the record
+the count started from) and the same count never nudges twice. A competing call stays silent.
+The transcript may lag the turn by a record or two, so a nudge can come one call late.
+At most one nudge is emitted per silent interval; text or compaction resets the limit.
+It saves a byte offset on every call and reads at least everything appended since that offset,
+so a large tool result cannot hide a visible line between calls. Silent on any error.
+
+It also adds context_size.py's band line, so a long autonomous turn meets the band when it
+crosses it, not at the owner's next prompt (#138). A sub-agent's call (`agent_id` in the
+input, code.claude.com/docs/en/hooks) is skipped whole: the owner never reads a sub-agent's
+text, the band is the lead's to act on, and a nudge it took was the lead's (#214). A worker
+session (MYAGENTKIT_ROLE=worker, set by spawn_worker.sh) gets the band but no nudge: it writes
+for the lead, whose chat the owner reads (#132).
+
+A second whole read of docs/STATE.md in a session (a Read without offset or limit, or a Bash
+`cat`) adds one note naming the section reading (#338: labricore's leads read it whole 3+ times
+a session, one 11 times). The count lives in the same state file and survives a compaction.
+"""
+import json
+import os
+import re
+from pathlib import Path
+import sys
+import tempfile
+
+# KARARLAR B08 inv1#253: Sonnet 5.5 prompting guide and Claude Code costs
+# (2026-10-15): stop after the second or third reminder; five and three were the starting values,
+# ten and one are the owner's (2026-10-26).
+MAX_NUDGES = 1
+STEP = 10
+# A pipe after it (`cat docs/STATE.md | head`) is no whole read in context (r338).
+STATE_CAT = re.compile(r'(^|[;&|(]\s*)cat\s+["\']?(\./)?docs/STATE\.md["\']?\s*($|;|&&|\))')
+RECOUNT = 512 * 1024  # re-read small transcripts; larger ones resume at the saved offset
+
+
+def silent_calls(path: Path, saved: dict) -> tuple[int, object, int]:
+    """Count from the beginning or a saved record boundary; never skip unread bytes."""
+    with open(path, 'rb') as stream:
+        stream.seek(0, 2)
+        size = stream.tell()
+        offset = saved.get('offset', 0)
+        if offset > size:  # a truncated transcript starts over
+            saved, offset = {}, 0
+        start = offset if size > RECOUNT else 0
+        stream.seek(start)
+        lines = []
+        while True:
+            offset = stream.tell()
+            line = stream.readline()
+            if not line.endswith(b'\n'):
+                break  # a partial record is read again on the next call
+            lines.append(line.decode('utf-8', errors='replace'))
+    total, mark = (saved['total'], saved['mark']) if start else (0, None)
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get('isSidechain'):
+            continue
+        if rec.get('type') == 'system' and rec.get('subtype') == 'compact_boundary':
+            total, mark = 0, rec.get('uuid')
+            continue
+        content = (rec.get('message') or {}).get('content') if rec.get('type') == 'assistant' else None
+        if not isinstance(content, list):
+            continue
+        if any(b.get('type') == 'text' and (b.get('text') or '').strip() for b in content if isinstance(b, dict)):
+            total, mark = 0, rec.get('uuid')  # the owner saw a line; a tool call in the same record comes after it
+        total += sum(1 for b in content if isinstance(b, dict) and b.get('type') == 'tool_use')
+    return total, mark, offset
+
+
+def context_size():
+    sys.dont_write_bytecode = True  # no untracked __pycache__ beside the synced hooks
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import context_size
+    return context_size
+
+
+def band_notice(data: dict) -> str:
+    try:
+        return context_size().notice(Path(data['transcript_path']))
+    except Exception:  # noqa: BLE001 - a competing check holds the lock, or an older context_size.py
+        return ''
+
+
+def whole_state_read(data: dict) -> int:
+    """1 when this call read docs/STATE.md whole: a Read without offset or limit, or a Bash cat."""
+    tool, given = data.get('tool_name'), data.get('tool_input') or {}
+    if tool == 'Read':
+        path = str(given.get('file_path') or '')
+        roots = {data.get('cwd'), os.environ.get('CLAUDE_PROJECT_DIR')} - {None, ''}
+        mine = path == 'docs/STATE.md' or any(
+            os.path.normcase(os.path.normpath(path)) == os.path.normcase(os.path.join(os.path.normpath(r), 'docs', 'STATE.md'))
+            for r in roots)  # this project's file, not another repository's (r338)
+        return int(mine and given.get('offset') is None and given.get('limit') is None)
+    return int(tool == 'Bash' and bool(STATE_CAT.search(str(given.get('command') or ''))))
+
+
+def owner_away() -> bool:
+    try:
+        return context_size().away()
+    except Exception:  # noqa: BLE001 - an older or missing context_size.py: the owner counts as present
+        return False
+
+
+def main() -> None:
+    data = json.loads(sys.stdin.buffer.read().decode('utf-8'))
+    if data.get('agent_id'):
+        return  # a sub-agent's call: the owner never reads its text, and it spent the lead's nudge (#214)
+    transcript = Path(data['transcript_path'])
+    state = transcript.with_suffix('.progress-step')
+    # The context_size.py lock: closing the file releases it, even on a kill.
+    with open(transcript.with_suffix('.progress-lock'), 'a+b') as lock:
+        if os.name == 'nt':
+            import msvcrt
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            saved = json.loads(state.read_text(encoding='utf-8'))
+            said = saved['said']
+            if (type(said) is not int or said < 0 or 'mark' not in saved
+                    or any(type(saved.get(key)) is not int or saved[key] < 0 for key in ('offset', 'total'))):
+                raise TypeError(saved)
+            nudges = saved.get('nudges', min(said // STEP, MAX_NUDGES))
+            if type(nudges) is not int or nudges < 0:
+                raise TypeError(saved)
+            nudges = min(nudges, MAX_NUDGES)  # an older kit allowed three: its spent stretch stays spent (#340)
+            reads = saved.get('state_reads', 0)
+            if type(reads) is not int or reads < 0:
+                raise TypeError(saved)
+        except (OSError, ValueError, KeyError, TypeError):
+            saved, said, nudges, reads = {}, None, 0, 0
+        reads += whole_state_read(data)
+        total, mark, offset = silent_calls(transcript, saved)
+        if saved:
+            if saved['mark'] != mark or said > total or saved['offset'] > offset:
+                said, nudges = None, 0  # visible text, compaction or truncation starts a new count
+        # Nobody reads a worker's chat; its own band still matters (#132).
+        nudge = (nudges < MAX_NUDGES and total // STEP > (said or 0) // STEP
+                 and os.environ.get('MYAGENTKIT_ROLE') != 'worker' and not owner_away())
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=state.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump({'said': total if nudge else (said or 0), 'mark': mark,
+                       'nudges': nudges + int(nudge), 'total': total, 'offset': offset,
+                       'state_reads': reads}, stream)
+        try:
+            os.replace(temporary, state)
+        finally:
+            temporary.unlink(missing_ok=True)
+    said = [('%d tool calls since the owner last saw a line from you. Say in one plain sentence, in the '
+             'chat language, what you are doing now and what you found, then continue (docs/COMMUNICATION.md, '
+             '"Progress"; core/docs/ in the kit).' % total)] if nudge else []
+    if reads == 2 and whole_state_read(data):
+        said.append('docs/STATE.md was read whole a second time this session. Read it by section: '
+                    "`grep -n '^## ' docs/STATE.md`, then a range (docs/AGENTS.md, \"STATE.md discipline\").")
+    said = ' '.join(said + [band_notice(data)]).strip()
+    if said:
+        print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': said}}))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:  # noqa: BLE001 - see the docstring
+        pass

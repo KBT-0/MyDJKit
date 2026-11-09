@@ -1,0 +1,267 @@
+#!/usr/bin/env sh
+# KIT-OWNED: do not edit locally; change it in the kit and re-sync.
+# The cross-model review wrapper. This project's reviewer and model pins live in
+# scripts/gate_config.sh, which it sources.
+#
+# Runs a SECOND model over the current change set in a throwaway copy of the checkout, archives
+# the raw output under docs/reviews/ together with the configuration that produced it, and
+# prints it. The gate itself is docs/REVIEW_GATE.md; this script only collects the evidence.
+#
+# Usage: review.sh [--uncommitted | --base <ref> | --commit <sha>] [--reviewer codex|claude]
+#                  [--fallback] [--backend NAME] [--allow-secret-file PATH]...
+#                  [--kit-verified [--kit DIR] [--kit-commit SHA]]
+#        review.sh --self-test
+#   default scope     --uncommitted (staged + unstaged + untracked) — the pre-commit case.
+#   default reviewer  the one configured below during setup.
+#   --fallback        if the reviewer cannot run (quota, rate limit, timeout, ...), let the OTHER
+#                     configured model review once. Off by default: without it a reviewer that
+#                     cannot run FAILS the review, it is never replaced. The substitute's
+#                     evidence carries a FALLBACK REVIEWER line. A setup fault (authentication,
+#                     sandbox, an unsupported CLI) never fails over; a used-up Codex quota
+#                     switches to Claude even without it (docs/REVIEW_RUNNING.md).
+#   --backend NAME    the Claude reviewer talks to the Anthropic-compatible endpoint that
+#                     NAME.env names, with that file's model as the pin, and is recorded as
+#                     reviewer claude@NAME (docs/REVIEW_RUNNING.md). The file lives outside the
+#                     repository: $MYAGENTKIT_BACKENDS_DIR, else %APPDATA%\myagentkit\backends or
+#                     ~/.config/myagentkit/backends; the old .myagentkit/backends/ is read too.
+#   --allow-secret-file PATH  review a file that looks like a secret (.env, *.pem, *.key,
+#                     .npmrc, .netrc, credentials*) knowingly; without it such a file in scope
+#                     stops the review (claude_bridge.secret_like). Repeat it per path.
+#   --kit-verified    with --commit or --base and the Claude reviewer: a kit upgrade's files that
+#                     are equal to the kit's own after git's line-ending normalisation (hash-object
+#                     --path, in the kit clone ~/.myagentkit/kit, or --kit DIR) at a released kit
+#                     commit are left out of the diff and listed as verified, not reviewed
+#                     (docs/REVIEW_RUNNING.md, "Kit upgrade commits"). The kit commit is the one
+#                     docs/kit/.kit-commit records, or --kit-commit SHA, the line sync-kit.sh prints.
+#
+# THE KIT TAKES NO POSITION ON WHICH MODEL WRITES AND WHICH REVIEWS. The rule is that the
+# AUTHOR never reviews its own patch and the REVIEWER is a different model — not that a
+# particular vendor holds a particular role. Both directions run through this one script and
+# publish the SAME evidence format, so records stay comparable when the roles swap.
+# (Which direction a family may review is the lead's rule, docs/WORKFLOW.md "cross";
+# this script runs every direction.)
+#
+# THE REVIEWER EXECUTES, NEVER IN THIS REPOSITORY. The adapter this script starts gives each
+# reviewer attempt its own throwaway copy (`git archive` of the reviewed commit, of HEAD for a
+# range, plus the uncommitted diff) as its working directory, tells it to run anything there,
+# and removes the copy when the attempt ends, on a cancel too. The copy is made in the adapter, not here: this script `exec`s the
+# adapter, whose signal handling owns a cancel, and the adapters are also called directly.
+# Threat model, in short (in full: claude_bridge.py, throwaway_copy):
+#   - Defended: what the reviewer runs in its working directory changes only the copy.
+#   - Defended: the repository's path is not in the prompt or the reviewer's environment.
+#   - Prevented: a shell write outside the copy and the temporary directories, and network
+#     use. Codex's workspace-write sandbox blocks both; Claude's Bash runs in Claude Code's
+#     own sandbox (macOS, Linux, WSL2), and a host where it cannot start fails the review. On
+#     native Windows Claude Code has no sandbox, so the Claude reviewer gets no Bash there.
+#   - Detected: a write that reaches the repository anyway fails the review (stale_checkout)
+#     when it changes HEAD, the base, the index, a tracked file or an untracked file Git does
+#     not ignore.
+#   - ACCEPTED LIMIT: a reviewer that finds the repository by its absolute path can read it.
+#   - ACCEPTED LIMIT: a reviewer's write that reaches a file Git ignores is not detected.
+#   - ACCEPTED LIMIT: a Claude --commit review of a commit that is not HEAD
+#     fingerprints the commit alone, so a write that reaches the repository is not detected.
+#   - OUT OF SCOPE: a process that changes the tree, the index or the Git configuration
+#     between two of this script's reads to hide a change (a filter attribute removed and
+#     restored), and hostile files planted by anyone but the owner: either could edit this
+#     script instead. An ordinary edit during a review fails it as stale_checkout.
+#
+# The sandbox is pinned HERE and in the adapters, not assumed of the CLI: the scope forms
+# above, --reviewer, --fallback, --backend, --allow-secret-file, --kit-verified, --kit and --kit-commit are the ONLY accepted arguments, and a backend
+# never relaxes the sandbox flags. There is deliberately no pass-through for further flags —
+# an agent must not be able to talk this script into a run outside the copy or with the
+# sandbox off. "Please be careful" is not a guarantee when the caller is a model.
+#
+# The result is INPUT to a review decision the CALLING agent owns, never a verdict to relay
+# verbatim (docs/REVIEW_RUNNING.md).
+#
+#   REVIEW_REVIEWER      override the configured reviewer for one run (codex | claude)
+#   MYAGENTKIT_BACKEND   the backend for one run when --backend is not given
+#   REVIEW_CODEX_MODEL   override the pinned Codex model for one run
+#   REVIEW_CLAUDE_MODEL  override the pinned Claude model for one run
+#   REVIEW_RISK      the brief's tier, low|medium|high; sets the default effort
+#   REVIEW_EFFORT    reasoning effort low|medium|high (default: high when REVIEW_RISK=high, else medium)
+#   REVIEW_FOCUS     portability | logic: one reviewer each on a high-tier change
+#   REVIEW_TASK_FILE the brief the prompt quotes; its Owns: line bounds the diff (owns_check.py)
+#   REVIEW_ROUND_EXCEPTION  the recorded reason for a third round under one label
+#   MYAGENTKIT_AUTHOR_EFFORT  the author's effort (default: high); with MYAGENTKIT_AUTHOR the
+#                    required review runs at it or above, high at most (docs/REVIEW_GATE.md, "Invariant")
+#   REVIEW_TIMEOUT_SECONDS  wall clock per attempt (default: 2700, 3600 for high-effort Codex; at most 3600)
+#   REVIEW_MAX_TURNS        Claude turns per attempt (default: 200, at most 500)
+#   REVIEW_CLI_BIN   the Codex binary             (default: codex)
+#   CLAUDE_CLI_BIN   the Claude binary            (default: claude)
+set -u
+# Windows installs Python as `python` or `py`: when `python3` is absent or does not run (a
+# Store alias exits 9009), the scripts call the first of those that runs under the usual
+# name. A function is enough for a call; an `exec` cannot run a function, so the exec sites
+# use $kit_python, the resolved command.
+if python3 -I -c '' </dev/null >/dev/null 2>&1; then kit_python=python3
+elif python -I -c '' </dev/null >/dev/null 2>&1; then kit_python=python
+else kit_python="py -3"; fi   # the launcher, told which Python: unquoted at every use
+[ "$kit_python" = python3 ] || python3() { $kit_python "$@"; }
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+repo_root="${REVIEW_REPO_ROOT:-$script_dir/..}"
+# Run from another checkout of the same repository (the main checkout's script in a worker's
+# linked worktree), the review and its Owns: check are of the checkout it runs in (#302).
+# The common Git directory is made absolute by cd, not by rev-parse's path-format option: Git
+# before 2.31 refused that, and the script's own checkout was reviewed.
+if [ -z "${REVIEW_REPO_ROOT:-}" ] && here=$(git rev-parse --show-toplevel 2>/dev/null) &&
+  common=$(CDPATH= cd -- "$(git rev-parse --git-common-dir 2>/dev/null)" && pwd -P) &&
+  [ "$common" = "$(CDPATH= cd -- "$repo_root" && CDPATH= cd -- "$(git rev-parse --git-common-dir 2>/dev/null)" && pwd -P)" ]; then
+  repo_root=$here
+fi
+# CDPATH cleared: exported, it sent a relative REVIEW_REPO_ROOT into another tree with that name.
+CDPATH= cd -- "$repo_root" || exit 2
+
+# The project's reviewer and pins, from the project-owned gate_config.sh beside this script
+# (#94); that file says why both pins ship empty. The defaults come first, so a gate_config.sh
+# written for an older kit still runs.
+DEFAULT_REVIEWER="claude" CODEX_MODEL="" CLAUDE_MODEL=""
+[ -f "$script_dir/gate_config.sh" ] || {
+  echo "FAIL [review]: scripts/gate_config.sh is missing; copy the kit's core/scripts/gate_config.sh there and set this project's values in it."
+  exit 2; }
+. "$script_dir/gate_config.sh"
+
+usage() {
+  echo "usage: review.sh [--uncommitted | --base <ref> | --commit <sha>] [--reviewer codex|claude] [--fallback] [--check] [--backend NAME] [--allow-secret-file PATH]... [--kit-verified [--kit DIR] [--kit-commit SHA]]"
+  echo "       review.sh --self-test"
+  exit 2
+}
+die() { printf '%s\n' "FAIL [review]: $1"; exit 2; }
+
+if [ "${1:-}" = "--self-test" ]; then
+  [ $# -eq 1 ] || usage
+  [ -s "$script_dir/test_claude_bridge.py" ] || die "review self-test file is missing or empty"
+  test_log=$(mktemp) || die "cannot create self-test log"
+  trap 'rm -f "$test_log"' EXIT HUP INT TERM
+  if ! python3 -B "$script_dir/test_claude_bridge.py" > "$test_log" 2>&1; then
+    cat "$test_log"
+    die "review self-tests failed"
+  fi
+  cat "$test_log"
+  # No completion line = no pass: an empty run is a failure (pytest exit code 5,
+  # docs.pytest.org/en/stable/reference/exit-codes.html; jest --passWithNoTests is opt-in, jestjs.io/docs/cli).
+  grep -qx 'REVIEW SELF-TEST: PASS' "$test_log" || die "review self-tests produced no completion evidence"
+  # The project's own suites: scripts/review_selftest.project.sh, project-owned and never
+  # shipped (so a sync never writes it), run after the kit's, executed like doctor.project.sh.
+  # Its own file, not check.project.sh: the gate runs on every commit and must stay short.
+  # Absent, nothing runs; present, it must run and print its own completion line.
+  hook="$script_dir/review_selftest.project.sh"
+  if [ -e "$hook" ] || [ -L "$hook" ]; then
+    first=""; IFS= read -r first < "$hook" || true
+    case $first in '#!'*) [ -x "$hook" ] || first="" ;; *) first="" ;; esac
+    [ -n "$first" ] || die "scripts/review_selftest.project.sh cannot run: make #!/bin/sh its first line, then chmod +x it and git update-index --chmod=+x it"
+    # Without the variables a git hook exports (check.sh's C8): its suites find their repository themselves.
+    # shellcheck disable=SC2046 # one name per line: split on purpose
+    ( unset $(git rev-parse --local-env-vars 2>/dev/null); exec "$hook" ) < /dev/null > "$test_log" 2>&1; hook_rc=$?
+    cat "$test_log"
+    [ "$hook_rc" -eq 0 ] || die "project self-tests failed (exit $hook_rc)"
+    grep -qx 'PROJECT SELF-TEST: PASS' "$test_log" || die "project self-tests produced no completion evidence (PROJECT SELF-TEST: PASS)"
+  fi
+  exit 0
+fi
+
+scope_flag="--uncommitted"
+scope_arg=""
+scope_seen=0
+fallback=""
+check=""
+reviewer="${REVIEW_REVIEWER:-}"
+backend="${MYAGENTKIT_BACKEND:-}"
+kit_verified=0
+kit=""
+kit_commit=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --uncommitted)
+      [ "$scope_seen" -eq 0 ] || usage
+      scope_seen=1; scope_flag="--uncommitted"; scope_arg=""; shift ;;
+    --base|--commit)
+      [ "$scope_seen" -eq 0 ] || usage
+      [ $# -ge 2 ] || usage
+      scope_seen=1; scope_flag="$1"; scope_arg="$2"
+      case "$scope_arg" in -*|*" "*|"") usage ;; esac
+      shift 2 ;;
+    --reviewer)
+      [ $# -ge 2 ] || usage
+      reviewer="$2"; shift 2 ;;
+    --fallback)
+      fallback="--allow-fallback"; shift ;;
+    --check)
+      check="--check"; shift ;;
+    --backend)
+      [ $# -ge 2 ] || usage
+      backend="$2"; shift 2 ;;
+    --allow-secret-file)
+      [ $# -ge 2 ] || usage
+      case "$2" in -*|"") usage ;; esac
+      case "$2" in *"
+"*) usage ;; esac
+      secret_files="${secret_files:-}$2
+"; shift 2 ;;
+    --kit-verified)
+      kit_verified=1; shift ;;
+    --kit)
+      [ $# -ge 2 ] || usage
+      case "$2" in -*|"") usage ;; esac
+      kit="$2"; shift 2 ;;
+    --kit-commit)
+      [ $# -ge 2 ] || usage
+      case "$2" in -*|"") usage ;; esac
+      kit_commit="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+# Unnamed, the reviewer follows the mode: solo reviews within its family (docs/REVIEW_GATE.md, "Invariant").
+[ -n "$reviewer" ] || reviewer=$($kit_python -B "$script_dir/review_dispatch.py" --mode-reviewer "$DEFAULT_REVIEWER") ||
+  { printf '%s\n' "$reviewer"; exit 2; }  # the dispatcher's FAIL line: STATE.md unreadable or its mode line refused
+# Windows Python ends the line with \r\n and $(...) strips only the \n (check.sh reads lines the same way).
+cr=$(printf '\r'); reviewer=${reviewer%"$cr"}
+# The reviewer is matched against a closed list rather than passed through. A value that
+# reaches a command line unchecked is how a scope flag becomes an argument injection.
+case "$reviewer" in
+  codex|claude) ;;
+  *) die "--reviewer must be codex or claude (got '$reviewer')" ;;
+esac
+
+set -- "$scope_flag"
+[ -n "$scope_arg" ] && set -- "$scope_flag" "$scope_arg"
+# A brief's Owns: line names the paths its worker may change (docs/HANDOFF.md, "The brief");
+# in cross mode the two sides never share a file, so a diff outside them is not reviewed.
+if [ -n "${REVIEW_TASK_FILE:-}" ]; then
+  python3 -B "$script_dir/owns_check.py" "$REVIEW_TASK_FILE" "$@" ||
+    die "the diff leaves the brief's Owns: paths, or they could not be checked (above)"
+fi
+# After owns_check, which parses only the scope flags; the dispatcher refuses the rest of a misuse.
+[ "$kit_verified" -eq 0 ] || [ "$scope_flag" != --uncommitted ] || usage
+[ -z "$kit$kit_commit" ] || [ "$kit_verified" -eq 1 ] || usage
+[ "$kit_verified" -eq 0 ] || set -- "$@" --kit-verified
+[ -z "$kit" ] || set -- "$@" --kit "$kit"
+[ -z "$kit_commit" ] || set -- "$@" --kit-commit "$kit_commit"
+# The dispatcher checks the name and reads the file; without a backend its argv is unchanged.
+if [ -n "$backend" ] && [ "$reviewer" = codex ]; then
+  printf '%s\n' 'review: --backend is ignored for --reviewer codex' >&2
+elif [ -n "$backend" ]; then
+  set -- "$@" --backend "$backend"
+fi
+
+# Reviewing CLIs are commonly per-user installs missing from a non-login shell's PATH: a
+# fallback, never first. An old standalone build left in ~/.local/bin once shadowed the
+# current binary on PATH and every review failed with "requires a newer version".
+[ -x "$HOME/.local/bin/codex" ] && { PATH="$PATH:$HOME/.local/bin"; export PATH; }
+
+# Without REVIEW_EFFORT the dispatcher's default follows REVIEW_RISK (docs/REVIEW_GATE.md, "Risk tiers").
+[ -n "${REVIEW_EFFORT:-}" ] && set -- --effort "$REVIEW_EFFORT" "$@"
+# Each secret-looking path the owner reviews knowingly, one argument each (a path may hold a space).
+if [ -n "${secret_files:-}" ]; then
+  while IFS= read -r secret; do
+    [ -n "$secret" ] && set -- "$@" --allow-secret-file "$secret"
+  done <<EOF
+$secret_files
+EOF
+fi
+# Only with --fallback does the dispatcher make one failover to the other configured pin.
+# Each adapter retains its own evidence and usage; a completed Reject never triggers another call.
+exec $kit_python -B "$script_dir/review_dispatch.py" --repo "$PWD" --reviewer "$reviewer" $fallback $check \
+  --claude-model "${REVIEW_CLAUDE_MODEL:-$CLAUDE_MODEL}" \
+  --codex-model "${REVIEW_CODEX_MODEL:-$CODEX_MODEL}" "$@"
